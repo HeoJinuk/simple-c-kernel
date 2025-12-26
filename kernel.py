@@ -122,17 +122,16 @@ class InputServer:
     def _check_interrupt(self): return False # Placeholder
     def get_port(self): return self.port
 
-
 # ==========================================
 # 3. Main Kernel Class
 # ==========================================
 
 class SimpleCKernel(Kernel):
     implementation = 'SimpleCKernel'
-    implementation_version = '1.1'
+    implementation_version = '1.2'
     language = 'c'
     language_version = 'C11'
-    banner = "Simple C Kernel v1.1"
+    banner = "Simple C Kernel v1.2"
     language_info = {'name': 'c', 'mimetype': 'text/x-csrc', 'file_extension': '.c'}
 
     def __init__(self, **kwargs):
@@ -148,14 +147,14 @@ class SimpleCKernel(Kernel):
         exe_file = os.path.join(self.build_dir, 'source.exe')
 
         try:
-            # [변경] 실행 과정을 try로 감싸서 KeyboardInterrupt 감지
+            # 실행 과정을 try로 감싸서 KeyboardInterrupt 감지
             if self._compile_code(code, src_file, exe_file):
                 self._run_process(exe_file)
                 
             return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
 
         except KeyboardInterrupt:
-            # [핵심] 주피터 'Stop' 버튼 클릭 시
+            # 주피터 'Stop' 버튼 클릭 시
             self._kill_process()
             self._print_stream("\n\033[31m> 사용자에 의해 실행이 중단되었습니다.\033[0m\n")
             self.send_response(self.iopub_socket, 'clear_output', {'wait': True})
@@ -166,14 +165,22 @@ class SimpleCKernel(Kernel):
             self._cleanup()
 
     def _compile_code(self, code, src_file, exe_file):
+        # 코드에서 특별한 컴파일 옵션 추출
+        extra_args = []
+        for line in code.splitlines():
+            if line.strip().startswith("//%cflags"):
+                options = line.replace("//%cflags", "").strip().split()
+                extra_args.extend(options)
+
         full_code = C_BOOTSTRAP_CODE + "\n" + code
         with open(src_file, 'w', encoding='utf-8') as f:
             f.write(full_code)
 
         try:
+            cmd = ['gcc', src_file, '-o', exe_file, '-fexec-charset=UTF-8'] + extra_args
             # cwd(현재 작업 경로)를 임시 폴더로 지정하여 컴파일
             subprocess.check_output(
-                ['gcc', src_file, '-o', exe_file, '-fexec-charset=UTF-8'], 
+                cmd,
                 stderr=subprocess.STDOUT, 
                 encoding='utf-8',
                 cwd=self.build_dir 
