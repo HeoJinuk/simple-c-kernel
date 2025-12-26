@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import shutil
 import tempfile
+import re
 
 # ==========================================
 # 1. Configuration & Templates
@@ -187,11 +188,19 @@ class SimpleCKernel(Kernel):
             )
             return True
         except subprocess.CalledProcessError as e:
-            self._print_stream(f"Compile Error:\n{e.output}")
+            colored_error = self._colorize_gcc_output(e.output)
+            self._print_stream(colored_error)
             return False
         except FileNotFoundError:
             self._print_stream("Error: GCC not found. Please install MinGW or GCC.")
             return False
+
+    def _colorize_gcc_output(self, text):
+        text = re.sub(r"(error:.*)", r"\033[1;31m\1\033[0m", text)
+        text = re.sub(r"(warning:.*)", r"\033[1;33m\1\033[0m", text)
+        text = re.sub(r"(note:.*)", r"\033[1;36m\1\033[0m", text)
+        text = re.sub(r"(source\.c:\d+:\d+:)", r"\033[1m\1\033[0m", text)
+        return text
 
     def _run_process(self, exe_file):
         if not os.path.exists(exe_file): return
