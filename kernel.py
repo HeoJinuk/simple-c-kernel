@@ -129,37 +129,41 @@ class InputServer:
 
 class SimpleCKernel(Kernel):
     implementation = 'SimpleCKernel'
-    implementation_version = '1.0'
+    implementation_version = '1.1'
     language = 'c'
     language_version = 'C11'
-    banner = "Simple C Kernel v1.0"
+    banner = "Simple C Kernel v1.1"
     language_info = {'name': 'c', 'mimetype': 'text/x-csrc', 'file_extension': '.c'}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.input_server = InputServer()
         self.cell_output_buffer = ""
+        self.current_process = None
 
     def do_execute(self, code, silent, store_history=True, user_expressions=None, allow_stdin=True):
         self.cell_output_buffer = ""
-        
-        # 임시 폴더 생성 (여기에 소스와 실행파일을 만듭니다)
         self.build_dir = tempfile.mkdtemp()
         src_file = os.path.join(self.build_dir, 'source.c')
         exe_file = os.path.join(self.build_dir, 'source.exe')
 
-        # 컴파일 시 임시 경로 사용
-        if not self._compile_code(code, src_file, exe_file):
-            self._cleanup() # 실패해도 정리
+        try:
+            # [변경] 실행 과정을 try로 감싸서 KeyboardInterrupt 감지
+            if self._compile_code(code, src_file, exe_file):
+                self._run_process(exe_file)
+                
             return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
 
-        # 실행 시 임시 경로 사용
-        self._run_process(exe_file)
+        except KeyboardInterrupt:
+            # [핵심] 주피터 'Stop' 버튼 클릭 시
+            self._kill_process()
+            self._print_stream("\n\033[31m> 사용자에 의해 실행이 중단되었습니다.\033[0m\n")
+            self.send_response(self.iopub_socket, 'clear_output', {'wait': True})
+            return {'status': 'abort', 'execution_count': self.execution_count}
         
-        # 정리 (임시 폴더 전체 삭제)
-        self._cleanup()
-
-        return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
+        finally:
+            self._kill_process()
+            self._cleanup()
 
     def _compile_code(self, code, src_file, exe_file):
         full_code = C_BOOTSTRAP_CODE + "\n" + code
@@ -169,7 +173,7 @@ class SimpleCKernel(Kernel):
         try:
             # cwd(현재 작업 경로)를 임시 폴더로 지정하여 컴파일
             subprocess.check_output(
-                ['gcc', src_file, '-o', exe_file], 
+                ['gcc', src_file, '-o', exe_file, '-fexec-charset=UTF-8'], 
                 stderr=subprocess.STDOUT, 
                 encoding='utf-8',
                 cwd=self.build_dir 
@@ -183,73 +187,67 @@ class SimpleCKernel(Kernel):
             return False
 
     def _run_process(self, exe_file):
-        try:
-            # 파일이 없으면 중단
-            if not os.path.exists(exe_file): return
+        if not os.path.exists(exe_file): return
 
-            process = subprocess.Popen(
-                [exe_file],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=0,
-                cwd=self.build_dir
-            )
-            
-            q = queue.Queue()
-            def reader_thread(proc, out_q):
-                while True:
-                    char = proc.stdout.read(1)
-                    if not char: break
-                    out_q.put(char)
-                proc.stdout.close()
-            
-            t = threading.Thread(target=reader_thread, args=(process, q), daemon=True)
-            t.start()
-
-            output_chunk = ""
-            req_marker = "<<__REQ__>>"
-
-            while t.is_alive() or not q.empty():
+        self.current_process = subprocess.Popen(
+            [exe_file],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=0,
+            cwd=self.build_dir
+        )
+        
+        q = queue.Queue()
+        def reader_thread(proc, out_q):
+            while True:
+                if proc.poll() is not None: break
                 try:
-                    char = q.get(timeout=0.05)
-                    output_chunk += char
-                    
-                    if req_marker in output_chunk:
-                        pre_text = output_chunk.replace(req_marker, "")
-                        self._print_stream(pre_text)
-                        output_chunk = ""
-                        
-                        user_input = self._handle_input_request()
-                        
-                        try:
-                            process.stdin.write(user_input + "\n")
-                            process.stdin.flush()
-                        except OSError: pass
-
-                    elif char == '\n' or len(output_chunk) > 200:
-                        self._print_stream(output_chunk)
-                        output_chunk = ""
-                        
-                except queue.Empty: continue
-
-            if output_chunk: self._print_stream(output_chunk)
-
-            # 파이프 명시적 닫기 (Cleanup을 돕기 위함)
-            try:
-                process.stdin.close()
-                if process.stdout: process.stdout.close()
+                    char = proc.stdout.read(1)
+                except ValueError: break 
+                
+                if not char: break
+                out_q.put(char)
+            try: proc.stdout.close()
             except: pass
+        
+        t = threading.Thread(target=reader_thread, args=(self.current_process, q), daemon=True)
+        t.start()
 
-            if process.poll() is None:
-                process.terminate()
-            process.wait()
+        output_chunk = ""
+        req_marker = "<<__REQ__>>"
 
-        except Exception as e:
-            self._print_stream(f"\nRuntime Error: {str(e)}")
+        while t.is_alive() or not q.empty():
+            try:
+                char = q.get(timeout=0.05)
+                output_chunk += char
+                
+                if req_marker in output_chunk:
+                    pre_text = output_chunk.replace(req_marker, "")
+                    self._print_stream(pre_text)
+                    output_chunk = ""
+                    
+                    user_input = self._handle_input_request()
+                    
+                    try:
+                        if self.current_process and self.current_process.stdin:
+                            self.current_process.stdin.write(user_input + "\n")
+                            self.current_process.stdin.flush()
+                    except OSError: pass
+
+                elif char == '\n' or len(output_chunk) > 200:
+                    self._print_stream(output_chunk)
+                    output_chunk = ""
+                    
+            except queue.Empty:
+                if self.current_process.poll() is not None and q.empty():
+                    break
+                continue
+
+        if output_chunk: self._print_stream(output_chunk)
 
     def _handle_input_request(self):
         req_id = str(uuid.uuid4())
@@ -274,6 +272,19 @@ class SimpleCKernel(Kernel):
     def _print_stream(self, text):
         self.cell_output_buffer += text
         self.send_response(self.iopub_socket, 'stream', {'name': 'stdout', 'text': text})
+    
+    def _kill_process(self):
+        """무한 루프 탈출을 위한 강력한 프로세스 종료"""
+        if self.current_process:
+            try:
+                self.current_process.terminate()
+                try:
+                    self.current_process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    # 좀비 프로세스 확인 사살
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except: pass
+            finally: self.current_process = None
 
     def _cleanup(self):
         """임시 폴더 전체 삭제 (파일 잠금 시 에러 무시)"""
