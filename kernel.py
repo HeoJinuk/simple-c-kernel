@@ -231,7 +231,6 @@ class SimpleCKernel(Kernel):
         q = queue.Queue()
         def reader_thread(proc, out_q):
             while True:
-                if proc.poll() is not None: break
                 try:
                     char = proc.stdout.read(1)
                 except ValueError: break 
