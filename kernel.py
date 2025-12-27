@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import shutil
 import tempfile
+import platform
+import signal
 import re
 
 # ==========================================
@@ -19,13 +21,19 @@ import re
 C_BOOTSTRAP_CODE = r"""
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h> 
+
+#ifdef _WIN32
+    #include <windows.h>
+    void _init_os() { SetConsoleOutputCP(65001); }
+#else
+    void _init_os() { }
+#endif
 
 /* 초기화: 버퍼링 끄기 및 한글 설정 */
 void __attribute__((constructor)) _init_jupyter() { 
     setvbuf(stdout, NULL, _IONBF, 0); 
     setvbuf(stderr, NULL, _IONBF, 0);
-    SetConsoleOutputCP(65001); 
+    _init_os();
 }
 
 /* 입력 트리거 함수: 파이썬에게 입력창 띄우라고 신호 보냄 */
@@ -129,10 +137,10 @@ class InputServer:
 
 class SimpleCKernel(Kernel):
     implementation = 'SimpleCKernel'
-    implementation_version = '1.2'
+    implementation_version = '2.0'
     language = 'c'
     language_version = 'C11'
-    banner = "Simple C Kernel v1.2"
+    banner = "Simple C Kernel v2.0"
     language_info = {'name': 'c', 'mimetype': 'text/x-csrc', 'file_extension': '.c'}
 
     def __init__(self, **kwargs):
@@ -140,12 +148,15 @@ class SimpleCKernel(Kernel):
         self.input_server = InputServer()
         self.cell_output_buffer = ""
         self.current_process = None
+        self.is_windows = (platform.system() == 'Windows')
 
     def do_execute(self, code, silent, store_history=True, user_expressions=None, allow_stdin=True):
         self.cell_output_buffer = ""
         self.build_dir = tempfile.mkdtemp()
+
+        exe_name = 'source.exe' if self.is_windows else 'source'
         src_file = os.path.join(self.build_dir, 'source.c')
-        exe_file = os.path.join(self.build_dir, 'source.exe')
+        exe_file = os.path.join(self.build_dir, exe_name)
 
         try:
             # 실행 과정을 try로 감싸서 KeyboardInterrupt 감지
@@ -220,7 +231,6 @@ class SimpleCKernel(Kernel):
         q = queue.Queue()
         def reader_thread(proc, out_q):
             while True:
-                if proc.poll() is not None: break
                 try:
                     char = proc.stdout.read(1)
                 except ValueError: break 
@@ -298,7 +308,10 @@ class SimpleCKernel(Kernel):
                     self.current_process.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     # 좀비 프로세스 확인 사살
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if self.is_windows:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        os.kill(self.current_process.pid, signal.SIGKILL)
             except: pass
             finally: self.current_process = None
 
